@@ -1,0 +1,20 @@
+[package]
+name = "pocketlink"
+description = "A friendlier, drag-and-drop desktop app for KDE Connect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pocketlink-core = { path = "../pocketlink-core" }
+futures.workspace = true
+open = "5.3"
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url.workspace = true
+
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic.git"
+features = ["about", "single-instance", "wgpu", "xdg-portal"]

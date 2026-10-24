@@ -1,0 +1,17 @@
+[package]
+name = "pocketlink-core"
+description = "Talks to the KDE Connect daemon over D-Bus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+futures.workspace = true
+serde = "1"
+tracing.workspace = true
+url.workspace = true
+zbus.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

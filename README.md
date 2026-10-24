@@ -57,9 +57,33 @@ D-Bus objects used, all under `/modules/kdeconnect/devices/<id>/`: `share` (`sha
 - COSMIC desktop (the main app may work on other desktops too)
 - Rust toolchain (`rustup`) to build
 
+## Build and run
+
+```bash
+sudo apt install pkg-config libxkbcommon-dev libwayland-dev libexpat1-dev \
+  libfontconfig-dev libfreetype-dev libinput-dev libudev-dev libegl-dev cmake
+cargo run -p pocketlink
+```
+
+`cargo run -p pocketlink-core --example probe` prints what the daemon reports
+about your devices, which is handy when something looks wrong.
+
 ## Status
 
-Early planning. Nothing is usable yet.
+Early, but usable for the basics:
+
+- [x] D-Bus client for the KDE Connect daemon (`pocketlink-core`)
+- [x] Main window: device page with battery ring and connection status
+- [x] Drag and drop files, links or text anywhere on the window to send them
+- [x] *Choose files…* and *Send clipboard* buttons
+- [x] Quick actions: ring phone, browse phone files, ping
+- [x] Activity list, received files with *Open* and *Show in folder*
+- [ ] Transfer progress bars and cancel
+- [ ] Notifications with reply, clipboard history
+- [ ] Media controls, saved commands
+- [ ] COSMIC panel applet
+- [ ] File manager *Send to phone*, global hotkey
+- [ ] Sending folders (zip on the fly)
 
 ## License
 
