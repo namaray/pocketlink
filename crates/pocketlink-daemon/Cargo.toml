@@ -1,0 +1,26 @@
+[package]
+name = "pocketlink-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Background service that connects Pocketlink to your phone"
+
+[dependencies]
+pocketlink-core = { version = "0.1.0", path = "../pocketlink-core" }
+pocketlink-proto = { version = "0.1.0", path = "../pocketlink-proto" }
+tokio.workspace = true
+zbus.workspace = true
+futures.workspace = true
+tracing.workspace = true
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+uuid = { version = "1.29.0", features = ["v4"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+open = "5.4.5"
+base64 = "0.23.1"
+dirs = "7.0.0"
+rustls-pki-types = "1.15.1"
+
+[dev-dependencies]
+if-addrs = "0.15.0"

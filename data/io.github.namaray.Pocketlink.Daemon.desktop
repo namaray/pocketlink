@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Pocketlink background service
+Comment=Keeps your phone connected
+Exec=pocketlink-daemon
+Icon=io.github.namaray.Pocketlink
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

@@ -1,6 +1,6 @@
 [package]
 name = "pocketlink-core"
-description = "Talks to the KDE Connect daemon over D-Bus"
+description = "Client for the Pocketlink daemon, and the types it shares with apps"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,10 +8,7 @@ repository.workspace = true
 
 [dependencies]
 futures.workspace = true
-serde = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.154"
 tracing.workspace = true
-url.workspace = true
 zbus.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true

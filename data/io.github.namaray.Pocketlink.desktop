@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Pocketlink
+Comment=Send files, see notifications and more from your phone
+Exec=pocketlink
+Icon=io.github.namaray.Pocketlink
+Terminal=false
+Categories=Network;Utility;
+Keywords=phone;android;share;send;notifications;kde connect;
+StartupNotify=true

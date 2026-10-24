@@ -1,89 +1,96 @@
 # Pocketlink
 
-A friendlier desktop app for connecting your phone to your PC, built for the COSMIC desktop.
+Your phone and your computer, together. Drag a file onto the window and it's on your phone.
+See your phone's notifications, reply to messages, ring a lost phone, browse its files.
 
-Pocketlink is a new UI on top of [KDE Connect](https://kdeconnect.kde.org/). It doesn't replace it.
-The KDE Connect background service (`kdeconnectd`) still handles pairing, encryption and the
-network protocol. Pocketlink talks to that service over D-Bus, so the KDE Connect Android/iOS app
-on your phone keeps working and nothing has to be paired again.
+Pocketlink is a standalone app for the COSMIC desktop. It doesn't need KDE Connect installed:
+it has its own background service, written in Rust, that speaks the
+[KDE Connect protocol](https://invent.kde.org/network/kdeconnect-meta) (version 8). That means it
+already works with the **KDE Connect app for Android and iOS** today, and with the Pocketlink
+Android app once that exists.
 
-## Why
-
-The stock KDE Connect app is mostly lists of text, and sending a file means picking it from a file
-chooser. Pocketlink aims for:
-
-- **Drag and drop everywhere.** Drop files, folders, text or links onto a device card, the panel
-  applet or the app window to send them.
-- **A visual, glanceable UI** instead of menus of text.
-
-## Planned features (v1)
+## Features
 
 | Area | What you get |
 | --- | --- |
-| Drag & drop sending | Drop onto the window, a device card, or the panel applet. Multiple files at once. |
-| Device dashboard | Battery ring, charging state, signal strength, *Ring my phone*, media controls with album art, saved-command tiles |
-| Transfers | Live transfer list with progress and cancel, plus a gallery of received files with *Open* and *Show in folder* |
-| Notifications | Phone notifications as cards, with reply and dismiss |
-| Clipboard | Two-way clipboard history |
-| COSMIC panel applet | Shows battery at a glance, accepts dropped files, opens quick actions |
-| Desktop integration | *Send to phone* in the file manager's right-click menu, and a global hotkey to send the clipboard |
+| Drag & drop | Drop files, links or text anywhere on the window to send them |
+| Pairing | Pair from either side, with a code shown on both screens to check |
+| Dashboard | Battery ring, charging state, signal strength, connection details |
+| Transfers | Live progress, cancel, and *Open* / *Show in folder* for received files |
+| Notifications | Phone notifications on your desktop and in the app, with reply and dismiss |
+| Clipboard | Send your clipboard to the phone; text from the phone lands on yours |
+| Quick actions | Ring phone, browse its files (via `sshfs`), ping |
 
-## Architecture
+## How it works
 
 ```
-┌──────────────────────────┐   ┌──────────────────────────┐
-│  pocketlink (app)        │   │  pocketlink-applet       │
-│  Rust + libcosmic        │   │  COSMIC panel applet     │
-└────────────┬─────────────┘   └────────────┬─────────────┘
-             └──────────────┬───────────────┘
-                 ┌──────────┴───────────┐
-                 │  pocketlink-core     │  zbus bindings + state
-                 └──────────┬───────────┘
-                            │ D-Bus (session bus)
-                 ┌──────────┴───────────┐
-                 │  kdeconnectd         │  unchanged, from your distro
-                 └──────────┬───────────┘
-                            │ LAN / Bluetooth
-                     📱 KDE Connect app on your phone
+┌────────────────────┐          D-Bus           ┌───────────────────────┐
+│  pocketlink (app)  │ ◀──────────────────────▶ │  pocketlink-daemon    │
+│  Rust + libcosmic  │  io.github.namaray.      │  pairing, plugins,    │
+└────────────────────┘  Pocketlink1             │  transfers, desktop   │
+                                                │  notifications        │
+                                                └──────────┬────────────┘
+                                                           │ pocketlink-proto
+                                         Wi-Fi: UDP 1716 discovery, TLS over TCP
+                                         (Bluetooth fallback: planned)
+                                                           │
+                                                   📱 phone app (KDE Connect
+                                                      protocol v8)
 ```
 
-D-Bus objects used, all under `/modules/kdeconnect/devices/<id>/`: `share` (`shareUrls`,
-`shareText`), `battery`, `connectivity_report`, `clipboard`, `notifications`, `mprisremote`,
-`findmyphone`, `sftp`, `sms`, `remotecommands`.
+| Crate | What it is |
+| --- | --- |
+| `pocketlink-proto` | The protocol: identity packets, certificates, discovery, the TLS handshake (with its flipped roles), pairing codes, payload transfers |
+| `pocketlink-daemon` | The background service: devices, pairing state, pinned certificates, plugins, transfers, the D-Bus API |
+| `pocketlink-core` | The D-Bus client and the shared types apps use |
+| `pocketlink` | The COSMIC app |
 
-## Requirements
-
-- KDE Connect ≥ 23.08 (`sudo apt install kdeconnect`) with a paired phone
-- COSMIC desktop (the main app may work on other desktops too)
-- Rust toolchain (`rustup`) to build
+Security works like KDE Connect: every device has a self-signed certificate, and pairing pins
+it. After pairing, a device claiming the same id with a different certificate is refused, and
+file transfers check the certificate on both ends.
 
 ## Build and run
 
 ```bash
 sudo apt install pkg-config libxkbcommon-dev libwayland-dev libexpat1-dev \
-  libfontconfig-dev libfreetype-dev libinput-dev libudev-dev libegl-dev cmake
-cargo run -p pocketlink
+  libfontconfig-dev libfreetype-dev libinput-dev libudev-dev libegl-dev cmake just sshfs
+just install    # app + daemon into ~/.local, D-Bus activation, autostart
+pocketlink
 ```
 
-`cargo run -p pocketlink-core --example probe` prints what the daemon reports
-about your devices, which is handy when something looks wrong.
+During development, `just daemon` runs the service in the foreground with debug logs and
+`just run` starts the app.
 
-## Status
+Pocketlink can run next to KDE Connect (they share UDP port 1716), but your phone will then see
+this computer twice. Once you're happy with Pocketlink, turn KDE Connect off.
 
-Early, but usable for the basics:
+Data lives in `~/.config/pocketlink` (your identity and paired devices). Received files go to
+your Downloads folder.
 
-- [x] D-Bus client for the KDE Connect daemon (`pocketlink-core`)
-- [x] Main window: device page with battery ring and connection status
-- [x] Drag and drop files, links or text anywhere on the window to send them
-- [x] *Choose files…* and *Send clipboard* buttons
-- [x] Quick actions: ring phone, browse phone files, ping
-- [x] Activity list, received files with *Open* and *Show in folder*
-- [ ] Transfer progress bars and cancel
-- [ ] Notifications with reply, clipboard history
-- [ ] Media controls, saved commands
-- [ ] COSMIC panel applet
-- [ ] File manager *Send to phone*, global hotkey
-- [ ] Sending folders (zip on the fly)
+## Tests
+
+```bash
+just test
+```
+
+Besides unit tests, this runs two end-to-end tests:
+
+- `pocketlink-proto/tests/loopback.rs`: two devices on loopback discover each other, handshake,
+  exchange packets and move a file; a transfer to the wrong certificate is refused.
+- `pocketlink-daemon/tests/e2e.rs`: starts the real daemon and drives it as a fake phone over
+  the network and D-Bus: pairing (checking the code), battery, notifications, replies, ringing,
+  files both ways, and a hostile file name.
+
+## Roadmap
+
+- [x] Own protocol implementation and daemon (no KDE Connect needed)
+- [x] App: pairing, drag and drop, transfers with progress, notifications with reply
+- [ ] Bluetooth fallback (the protocol's RFCOMM transport)
+- [ ] Pocketlink Android app (fork of KDE Connect Android with a new UI)
+- [ ] mDNS discovery, for networks that block broadcasts
+- [ ] Media controls, saved commands, clipboard history
+- [ ] COSMIC panel applet, *Send to phone* in the file manager, global hotkey
+- [ ] Sending folders
 
 ## License
 

@@ -1,39 +1,63 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Client for the KDE Connect daemon (`kdeconnectd`) on the D-Bus session bus.
+//! Client for the Pocketlink daemon, plus the types it shares with the app.
 //!
-//! Pocketlink never speaks the KDE Connect network protocol itself. Pairing,
-//! encryption and transport stay inside the daemon; this crate only reads its
-//! state and asks it to do things.
+//! The daemon (`pocketlink-daemon`) owns the connections to phones. Apps talk
+//! to it on the D-Bus session bus; state comes across as JSON so both sides can
+//! evolve without breaking the bus interface.
 
 use std::path::Path;
 
 use futures::{Stream, StreamExt};
-use zbus::message::Type as MessageType;
-use zbus::zvariant::OwnedValue;
-use zbus::{Connection, MatchRule, MessageStream};
+use serde::{Deserialize, Serialize};
 
 pub use zbus::Error;
 pub type Result<T> = zbus::Result<T>;
 
-const SERVICE: &str = "org.kde.kdeconnect";
-const ROOT: &str = "/modules/kdeconnect";
-const DAEMON_IFACE: &str = "org.kde.kdeconnect.daemon";
-const DEVICE_IFACE: &str = "org.kde.kdeconnect.device";
+pub const BUS_NAME: &str = "io.github.namaray.Pocketlink";
+pub const OBJECT_PATH: &str = "/io/github/namaray/Pocketlink";
+pub const INTERFACE: &str = "io.github.namaray.Pocketlink1";
 
-/// A paired phone or tablet, as last reported by the daemon.
-#[derive(Debug, Clone, PartialEq)]
+/// Packet types, used here as capability names.
+pub mod caps {
+    pub const SHARE: &str = "kdeconnect.share.request";
+    pub const CLIPBOARD: &str = "kdeconnect.clipboard";
+    pub const RING: &str = "kdeconnect.findmyphone.request";
+    pub const PING: &str = "kdeconnect.ping";
+    pub const SFTP: &str = "kdeconnect.sftp.request";
+    pub const NOTIFICATION_REPLY: &str = "kdeconnect.notification.reply";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Device {
     pub id: String,
     pub name: String,
     pub kind: DeviceKind,
     pub reachable: bool,
-    pub plugins: Vec<String>,
+    pub pair: PairState,
+    /// The link it is reachable over right now.
+    pub transport: Option<Transport>,
+    pub address: Option<String>,
+    /// Packet types the device accepts from us.
+    pub accepts: Vec<String>,
     pub battery: Option<Battery>,
     pub signal: Option<Signal>,
+    pub notifications: Vec<Notification>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl Device {
+    pub fn paired(&self) -> bool {
+        self.pair == PairState::Paired
+    }
+
+    /// Whether the device is connected, paired, and accepts `capability`.
+    pub fn can(&self, capability: &str) -> bool {
+        self.reachable && self.paired() && self.accepts.iter().any(|c| c == capability)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DeviceKind {
     Phone,
     Tablet,
@@ -44,7 +68,7 @@ pub enum DeviceKind {
 }
 
 impl DeviceKind {
-    fn parse(kind: &str) -> Self {
+    pub fn parse(kind: &str) -> Self {
         match kind {
             "phone" | "smartphone" => Self::Phone,
             "tablet" => Self::Tablet,
@@ -56,14 +80,32 @@ impl DeviceKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PairState {
+    Unpaired,
+    /// We asked; waiting for them to accept. `code` should match on both screens.
+    Requested { code: String },
+    /// They asked; waiting for us to accept.
+    RequestedByPeer { code: String },
+    Paired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    Wifi,
+    Bluetooth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Battery {
-    /// Charge in percent, 0–100.
+    /// Percent, 0–100.
     pub charge: u8,
     pub charging: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signal {
     /// Bars, 0–4.
     pub strength: u8,
@@ -71,218 +113,237 @@ pub struct Signal {
     pub network: String,
 }
 
-impl Device {
-    pub fn has_plugin(&self, plugin: &str) -> bool {
-        self.plugins.iter().any(|p| p == plugin)
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notification {
+    pub id: String,
+    pub app: String,
+    pub title: String,
+    pub text: String,
+    pub time: Option<i64>,
+    pub dismissable: bool,
+    /// Set when the notification accepts a typed reply.
+    pub reply_id: Option<String>,
+    pub actions: Vec<String>,
 }
 
-/// Something changed on the daemon side.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Transfer {
+    pub id: u64,
+    pub device_id: String,
+    pub direction: Direction,
+    /// File name, or "3 files" for a batch.
+    pub name: String,
+    pub done: u64,
+    pub total: u64,
+    pub state: TransferState,
+    /// Where a received file was saved.
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    Incoming,
+    Outgoing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum TransferState {
+    Active,
+    Done,
+    Failed { error: String },
+    Cancelled,
+}
+
+/// Something happened in the daemon.
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// The phone sent us a file; `url` points at where the daemon saved it.
-    ShareReceived { device_id: String, url: String },
-    /// Device list or some device state changed. Re-read with [`Client::devices`].
+    /// Device list or device state changed. Re-read with [`Client::devices`].
     Changed,
+    /// A transfer started, progressed or finished.
+    Transfer(Transfer),
+    /// The phone sent text or a link to our clipboard.
+    ClipboardReceived { device_id: String, text: String },
+    /// A device wants to pair.
+    PairRequest { device_id: String, name: String, code: String },
+}
+
+#[zbus::proxy(
+    interface = "io.github.namaray.Pocketlink1",
+    default_service = "io.github.namaray.Pocketlink",
+    default_path = "/io/github/namaray/Pocketlink"
+)]
+trait Daemon {
+    fn devices(&self) -> zbus::Result<String>;
+    fn transfers(&self) -> zbus::Result<String>;
+    fn refresh(&self) -> zbus::Result<()>;
+    fn add_address(&self, address: &str) -> zbus::Result<()>;
+    fn pair(&self, id: &str) -> zbus::Result<()>;
+    fn accept_pair(&self, id: &str) -> zbus::Result<()>;
+    fn reject_pair(&self, id: &str) -> zbus::Result<()>;
+    fn unpair(&self, id: &str) -> zbus::Result<()>;
+    fn send_files(&self, id: &str, paths: &[&str]) -> zbus::Result<()>;
+    fn send_text(&self, id: &str, text: &str) -> zbus::Result<()>;
+    fn send_clipboard(&self, id: &str, text: &str) -> zbus::Result<()>;
+    fn ring(&self, id: &str) -> zbus::Result<()>;
+    fn ping(&self, id: &str) -> zbus::Result<()>;
+    fn browse(&self, id: &str) -> zbus::Result<()>;
+    fn reply_notification(&self, id: &str, reply_id: &str, message: &str) -> zbus::Result<()>;
+    fn dismiss_notification(&self, id: &str, notification_id: &str) -> zbus::Result<()>;
+    fn cancel_transfer(&self, transfer_id: u64) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn changed(&self) -> zbus::Result<()>;
+    #[zbus(signal)]
+    fn transfer_changed(&self, transfer: &str) -> zbus::Result<()>;
+    #[zbus(signal)]
+    fn clipboard_received(&self, id: &str, text: &str) -> zbus::Result<()>;
+    #[zbus(signal)]
+    fn pair_requested(&self, id: &str, name: &str, code: &str) -> zbus::Result<()>;
 }
 
 #[derive(Debug, Clone)]
 pub struct Client {
-    conn: Connection,
+    proxy: DaemonProxy<'static>,
 }
 
 impl Client {
+    /// Connect to the daemon, starting it through D-Bus activation if needed.
     pub async fn connect() -> Result<Self> {
+        let conn = zbus::Connection::session().await?;
         Ok(Self {
-            conn: Connection::session().await?,
+            proxy: DaemonProxy::new(&conn).await?,
         })
     }
 
-    /// All paired devices, reachable or not.
+    /// Paired devices, plus unpaired ones that are reachable right now.
     pub async fn devices(&self) -> Result<Vec<Device>> {
-        let ids: Vec<String> = self
-            .call(ROOT, DAEMON_IFACE, "devices", &(false, true))
-            .await?;
-
-        let mut devices = Vec::with_capacity(ids.len());
-        for id in ids {
-            match self.device(&id).await {
-                Ok(device) => devices.push(device),
-                Err(err) => tracing::warn!(%id, %err, "skipping device"),
-            }
-        }
-        Ok(devices)
+        json(&self.proxy.devices().await?)
     }
 
-    pub async fn device(&self, id: &str) -> Result<Device> {
-        let path = device_path(id);
-        let reachable: bool = self.property(&path, DEVICE_IFACE, "isReachable").await?;
-        let plugins: Vec<String> = if reachable {
-            self.call(&path, DEVICE_IFACE, "loadedPlugins", &())
-                .await
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        let has = |p: &str| plugins.iter().any(|x| x == p);
-        let battery = if has("kdeconnect_battery") {
-            self.battery(id).await.ok()
-        } else {
-            None
-        };
-        let signal = if has("kdeconnect_connectivity_report") {
-            self.signal(id).await.ok().flatten()
-        } else {
-            None
-        };
-
-        Ok(Device {
-            id: id.to_owned(),
-            name: self.property(&path, DEVICE_IFACE, "name").await?,
-            kind: DeviceKind::parse(&self.property::<String>(&path, DEVICE_IFACE, "type").await?),
-            reachable,
-            plugins,
-            battery,
-            signal,
-        })
+    pub async fn transfers(&self) -> Result<Vec<Transfer>> {
+        json(&self.proxy.transfers().await?)
     }
 
-    async fn battery(&self, id: &str) -> Result<Battery> {
-        let (path, iface) = plugin(id, "battery");
-        let charge: i32 = self.property(&path, &iface, "charge").await?;
-        Ok(Battery {
-            charge: charge.clamp(0, 100) as u8,
-            charging: self.property(&path, &iface, "isCharging").await?,
-        })
+    /// Announce ourselves on the network again.
+    pub async fn refresh(&self) -> Result<()> {
+        self.proxy.refresh().await
     }
 
-    async fn signal(&self, id: &str) -> Result<Option<Signal>> {
-        let (path, iface) = plugin(id, "connectivity_report");
-        let strength: i32 = self.property(&path, &iface, "cellularNetworkStrength").await?;
-        if strength < 0 {
-            return Ok(None);
-        }
-        Ok(Some(Signal {
-            strength: strength.clamp(0, 4) as u8,
-            network: self.property(&path, &iface, "cellularNetworkType").await?,
-        }))
+    /// Reach a device by IP when broadcasts don't get through (VPNs, guest Wi-Fi).
+    pub async fn add_address(&self, address: &str) -> Result<()> {
+        self.proxy.add_address(address).await
     }
 
-    /// Send files to the device. Directories are not supported by the daemon and
-    /// should be filtered out by the caller.
+    pub async fn pair(&self, id: &str) -> Result<()> {
+        self.proxy.pair(id).await
+    }
+
+    pub async fn accept_pair(&self, id: &str) -> Result<()> {
+        self.proxy.accept_pair(id).await
+    }
+
+    pub async fn reject_pair(&self, id: &str) -> Result<()> {
+        self.proxy.reject_pair(id).await
+    }
+
+    pub async fn unpair(&self, id: &str) -> Result<()> {
+        self.proxy.unpair(id).await
+    }
+
+    /// Send files. Progress arrives as [`Event::Transfer`].
     pub async fn send_files<P: AsRef<Path>>(&self, id: &str, files: &[P]) -> Result<()> {
-        let urls: Vec<String> = files
+        let paths: Vec<String> = files
             .iter()
-            .filter_map(|p| url::Url::from_file_path(p.as_ref()).ok())
-            .map(String::from)
+            .map(|p| p.as_ref().to_string_lossy().into_owned())
             .collect();
-        let (path, iface) = plugin(id, "share");
-        self.call(&path, &iface, "shareUrls", &(urls,)).await
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        self.proxy.send_files(id, &paths).await
     }
 
-    /// Send a link or a piece of text. Links open on the phone, text lands on its clipboard.
+    /// Send a link (opens on the phone) or text.
     pub async fn send_text(&self, id: &str, text: &str) -> Result<()> {
-        let (path, iface) = plugin(id, "share");
-        if looks_like_url(text) {
-            self.call(&path, &iface, "shareUrl", &(text,)).await
-        } else {
-            self.call(&path, &iface, "shareText", &(text,)).await
-        }
+        self.proxy.send_text(id, text).await
     }
 
-    /// Put `text` on the device's clipboard.
-    ///
-    /// The caller reads the clipboard itself: on Wayland the daemon often can't
-    /// see it, but a focused window can.
+    /// Put `text` on the phone's clipboard.
     pub async fn send_clipboard(&self, id: &str, text: &str) -> Result<()> {
-        let (path, iface) = plugin(id, "clipboard");
-        self.call(&path, &iface, "sendClipboard", &(text,)).await
+        self.proxy.send_clipboard(id, text).await
     }
 
     /// Make the phone ring loudly, even when on silent.
     pub async fn ring(&self, id: &str) -> Result<()> {
-        let (path, iface) = plugin(id, "findmyphone");
-        self.call(&path, &iface, "ring", &()).await
+        self.proxy.ring(id).await
     }
 
     pub async fn ping(&self, id: &str) -> Result<()> {
-        let (path, iface) = plugin(id, "ping");
-        self.call(&path, &iface, "sendPing", &()).await
+        self.proxy.ping(id).await
     }
 
     /// Mount the phone's storage and open it in the file manager.
-    pub async fn browse(&self, id: &str) -> Result<bool> {
-        let (path, iface) = plugin(id, "sftp");
-        self.call(&path, &iface, "startBrowsing", &()).await
+    pub async fn browse(&self, id: &str) -> Result<()> {
+        self.proxy.browse(id).await
     }
 
-    /// Signals from the daemon, mapped to [`Event`]s.
+    pub async fn reply_notification(&self, id: &str, reply_id: &str, message: &str) -> Result<()> {
+        self.proxy.reply_notification(id, reply_id, message).await
+    }
+
+    pub async fn dismiss_notification(&self, id: &str, notification_id: &str) -> Result<()> {
+        self.proxy.dismiss_notification(id, notification_id).await
+    }
+
+    pub async fn cancel_transfer(&self, transfer_id: u64) -> Result<()> {
+        self.proxy.cancel_transfer(transfer_id).await
+    }
+
+    /// Everything the daemon announces, as [`Event`]s.
     pub async fn events(&self) -> Result<impl Stream<Item = Event> + use<>> {
-        let rule = MatchRule::builder()
-            .msg_type(MessageType::Signal)
-            .path_namespace(ROOT)?
-            .build();
-        let stream = MessageStream::for_match_rule(rule, &self.conn, Some(64)).await?;
+        let changed = self.proxy.receive_changed().await?.map(|_| Event::Changed);
+        let transfers = self
+            .proxy
+            .receive_transfer_changed()
+            .await?
+            .filter_map(|s| async move {
+                let args = s.args().ok()?;
+                serde_json::from_str(args.transfer()).ok().map(Event::Transfer)
+            });
+        let clipboard = self
+            .proxy
+            .receive_clipboard_received()
+            .await?
+            .filter_map(|s| async move {
+                let args = s.args().ok()?;
+                Some(Event::ClipboardReceived {
+                    device_id: args.id().to_string(),
+                    text: args.text().to_string(),
+                })
+            });
+        let pairing = self
+            .proxy
+            .receive_pair_requested()
+            .await?
+            .filter_map(|s| async move {
+                let args = s.args().ok()?;
+                Some(Event::PairRequest {
+                    device_id: args.id().to_string(),
+                    name: args.name().to_string(),
+                    code: args.code().to_string(),
+                })
+            });
 
-        Ok(stream.filter_map(|msg| async move {
-            let msg = msg.ok()?;
-            let header = msg.header();
-            let member = header.member()?.as_str();
-            let path = header.path()?.as_str();
-
-            if member == "shareReceived" {
-                let url: String = msg.body().deserialize().ok()?;
-                let device_id = path
-                    .strip_prefix("/modules/kdeconnect/devices/")?
-                    .split('/')
-                    .next()?
-                    .to_owned();
-                return Some(Event::ShareReceived { device_id, url });
-            }
-            Some(Event::Changed)
-        }))
-    }
-
-    async fn call<A, R>(&self, path: &str, iface: &str, method: &str, args: &A) -> Result<R>
-    where
-        A: serde::Serialize + zbus::zvariant::DynamicType,
-        R: for<'d> zbus::zvariant::DynamicDeserialize<'d>,
-    {
-        let reply = self
-            .conn
-            .call_method(Some(SERVICE), path, Some(iface), method, args)
-            .await?;
-        reply.body().deserialize()
-    }
-
-    async fn property<T>(&self, path: &str, iface: &str, name: &str) -> Result<T>
-    where
-        T: TryFrom<OwnedValue>,
-        T::Error: Into<zbus::zvariant::Error>,
-    {
-        let value: OwnedValue = self
-            .call(path, "org.freedesktop.DBus.Properties", "Get", &(iface, name))
-            .await?;
-        T::try_from(value).map_err(|e| Error::Variant(e.into()))
+        Ok(futures::stream::select_all([
+            changed.boxed(),
+            transfers.boxed(),
+            clipboard.boxed(),
+            pairing.boxed(),
+        ]))
     }
 }
 
-fn device_path(id: &str) -> String {
-    format!("{ROOT}/devices/{id}")
-}
-
-fn plugin(id: &str, name: &str) -> (String, String) {
-    (
-        format!("{ROOT}/devices/{id}/{name}"),
-        format!("{DEVICE_IFACE}.{name}"),
-    )
-}
-
-fn looks_like_url(text: &str) -> bool {
-    let text = text.trim();
-    !text.contains(char::is_whitespace)
-        && url::Url::parse(text).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+fn json<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T> {
+    serde_json::from_str(text).map_err(|e| Error::Failure(format!("bad reply from daemon: {e}")))
 }
 
 #[cfg(test)]
@@ -290,16 +351,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_links() {
-        assert!(looks_like_url("https://example.com/a?b=c"));
-        assert!(!looks_like_url("hello world"));
-        assert!(!looks_like_url("see https://example.com"));
-        assert!(!looks_like_url("file:///etc/passwd"));
+    fn pair_state_json() {
+        let state = PairState::RequestedByPeer { code: "ABCD1234".into() };
+        let text = serde_json::to_string(&state).unwrap();
+        assert_eq!(text, r#"{"state":"requested_by_peer","code":"ABCD1234"}"#);
+        assert_eq!(serde_json::from_str::<PairState>(&text).unwrap(), state);
     }
 
     #[test]
-    fn parses_device_kind() {
-        assert_eq!(DeviceKind::parse("phone"), DeviceKind::Phone);
-        assert_eq!(DeviceKind::parse("toaster"), DeviceKind::Unknown);
+    fn device_capabilities() {
+        let device = Device {
+            id: "x".into(),
+            name: "Phone".into(),
+            kind: DeviceKind::Phone,
+            reachable: true,
+            pair: PairState::Paired,
+            transport: Some(Transport::Wifi),
+            address: None,
+            accepts: vec![caps::RING.into()],
+            battery: None,
+            signal: None,
+            notifications: vec![],
+        };
+        assert!(device.can(caps::RING));
+        assert!(!device.can(caps::SHARE));
     }
 }

@@ -50,19 +50,6 @@ pub fn parse(mime: &str, data: &[u8]) -> Option<Payload> {
     Some(Payload::Text(text.to_owned()))
 }
 
-/// "photo.jpg", or "photo.jpg and 2 more".
-pub fn describe(files: &[PathBuf]) -> String {
-    let first = files
-        .first()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    match files.len() {
-        0 | 1 => first,
-        n => format!("{first} and {} more", n - 1),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,13 +85,5 @@ mod tests {
             parse("text/plain", b"file:///tmp/x.txt"),
             Some(Payload::Files(vec![PathBuf::from("/tmp/x.txt")]))
         );
-    }
-
-    #[test]
-    fn describes_files() {
-        let one = vec![PathBuf::from("/a/photo.jpg")];
-        assert_eq!(describe(&one), "photo.jpg");
-        let three = vec![one[0].clone(), "/b".into(), "/c".into()];
-        assert_eq!(describe(&three), "photo.jpg and 2 more");
     }
 }

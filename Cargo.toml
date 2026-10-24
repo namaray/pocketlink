@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/pocketlink-core", "crates/pocketlink"]
+members = ["crates/pocketlink-proto", "crates/pocketlink-core", "crates/pocketlink-daemon", "crates/pocketlink"]
 
 [workspace.package]
 version = "0.1.0"
