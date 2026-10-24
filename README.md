@@ -31,8 +31,8 @@ Android app once that exists.
                                                 │  notifications        │
                                                 └──────────┬────────────┘
                                                            │ pocketlink-proto
-                                         Wi-Fi: UDP 1716 discovery, TLS over TCP
-                                         (Bluetooth fallback: planned)
+                              Wi-Fi: UDP 1716 discovery, TLS over TCP
+                              Bluetooth: RFCOMM via BlueZ + channel multiplexer
                                                            │
                                                    📱 phone app (KDE Connect
                                                       protocol v8)
@@ -40,7 +40,7 @@ Android app once that exists.
 
 | Crate | What it is |
 | --- | --- |
-| `pocketlink-proto` | The protocol: identity packets, certificates, discovery, the TLS handshake (with its flipped roles), pairing codes, payload transfers |
+| `pocketlink-proto` | The protocol: identity packets, certificates, discovery, the TLS handshake (with its flipped roles), pairing codes, payload transfers, and the Bluetooth multiplexer |
 | `pocketlink-daemon` | The background service: devices, pairing state, pinned certificates, plugins, transfers, the D-Bus API |
 | `pocketlink-core` | The D-Bus client and the shared types apps use |
 | `pocketlink` | The COSMIC app |
@@ -48,6 +48,18 @@ Android app once that exists.
 Security works like KDE Connect: every device has a self-signed certificate, and pairing pins
 it. After pairing, a device claiming the same id with a different certificate is refused, and
 file transfers check the certificate on both ends.
+
+## Wi-Fi and Bluetooth
+
+Pocketlink prefers Wi-Fi. When a paired phone is also reachable over Bluetooth, it keeps that
+link open too, and carries on over Bluetooth when Wi-Fi goes away (and back when it returns).
+Bluetooth is slow (roughly 100–200 KB/s), so it's best for notifications, clipboard, battery and
+small files; browsing the phone's files needs Wi-Fi.
+
+To use Bluetooth, pair the phone with this computer in the system Bluetooth settings first, and
+turn on Bluetooth in the phone app's settings. There's no TLS over Bluetooth: the link is
+protected by Bluetooth pairing, and the device's certificate is still checked against the one
+pinned when you paired it in Pocketlink.
 
 ## Build and run
 
@@ -77,6 +89,8 @@ Besides unit tests, this runs two end-to-end tests:
 
 - `pocketlink-proto/tests/loopback.rs`: two devices on loopback discover each other, handshake,
   exchange packets and move a file; a transfer to the wrong certificate is refused.
+- `pocketlink-daemon` unit tests include a fake phone over an in-memory Bluetooth link: pairing
+  and files both ways through multiplexer channels.
 - `pocketlink-daemon/tests/e2e.rs`: starts the real daemon and drives it as a fake phone over
   the network and D-Bus: pairing (checking the code), battery, notifications, replies, ringing,
   files both ways, and a hostile file name.
@@ -85,7 +99,7 @@ Besides unit tests, this runs two end-to-end tests:
 
 - [x] Own protocol implementation and daemon (no KDE Connect needed)
 - [x] App: pairing, drag and drop, transfers with progress, notifications with reply
-- [ ] Bluetooth fallback (the protocol's RFCOMM transport)
+- [x] Bluetooth fallback (RFCOMM + multiplexer), needs testing with a real phone
 - [ ] Pocketlink Android app (fork of KDE Connect Android with a new UI)
 - [ ] mDNS discovery, for networks that block broadcasts
 - [ ] Media controls, saved commands, clipboard history

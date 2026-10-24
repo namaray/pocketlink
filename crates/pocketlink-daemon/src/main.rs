@@ -2,6 +2,7 @@
 
 //! `pocketlink-daemon`: keeps your phone connected in the background.
 
+mod bluez;
 mod daemon;
 mod dbus;
 mod notify;
@@ -55,7 +56,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (me_tx, me_rx) = watch::channel(me);
 
     let (signals_tx, signals_rx) = mpsc::unbounded_channel();
-    let daemon = Arc::new(Daemon::new(store, identity, tls.clone(), me_tx, signals_tx));
+    let daemon = Arc::new(Daemon::new(store, identity.clone(), tls.clone(), me_tx, signals_tx));
 
     let bus = zbus::connection::Builder::session()?
         .serve_at(OBJECT_PATH, dbus::Api { daemon: daemon.clone() })?
@@ -85,10 +86,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(port) = std::env::var("POCKETLINK_UDP_PORT").ok().and_then(|p| p.parse().ok()) {
         config.udp_port = port;
     }
-    let (conn_tx, conn_rx) = mpsc::channel(16);
-    let lan = Lan::start(config, me_rx, tls, conn_tx).await?;
+    let (lan_tx, lan_rx) = mpsc::channel(16);
+    let lan = Lan::start(config, me_rx.clone(), tls, lan_tx).await?;
     daemon.set_lan(lan.clone());
-    tokio::spawn(daemon.clone().run(conn_rx));
+    let (bt_tx, bt_rx) = mpsc::channel(4);
+    tokio::spawn(daemon.clone().run(lan_rx, bt_rx));
+    if !test_mode("POCKETLINK_NO_BLUETOOTH") {
+        tokio::spawn(bluez::start(daemon.clone(), identity, me_rx, bt_tx));
+    }
 
     if !test_mode("POCKETLINK_NO_BROADCAST") {
         tokio::spawn(async move {

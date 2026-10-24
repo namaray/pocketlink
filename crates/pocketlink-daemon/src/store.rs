@@ -57,6 +57,10 @@ impl Store {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no config directory"))?
                 .join("pocketlink"),
         };
+        Self::at(dir)
+    }
+
+    pub fn at(dir: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
         Ok(Self { dir })

@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pocketlink_core::{self as api, Direction, TransferState};
+use pocketlink_proto::bluetooth::{self, BtConnection};
 use pocketlink_proto::lan::{self, Lan};
+use pocketlink_proto::mux::{LineReader, Mux};
 use pocketlink_proto::payload::{self, PayloadServer};
 use pocketlink_proto::{Connection, DeviceInfo, Identity, Packet, TlsConfigs, identity, packet};
 use rustls_pki_types::CertificateDer;
@@ -85,7 +87,8 @@ struct State {
 struct DeviceState {
     info: DeviceInfo,
     cert: Option<CertificateDer<'static>>,
-    link: Option<Link>,
+    /// At most one per transport.
+    links: Vec<Link>,
     pair: Pair,
     battery: Option<api::Battery>,
     signal: Option<api::Signal>,
@@ -100,7 +103,7 @@ impl DeviceState {
         Self {
             info,
             cert: None,
-            link: None,
+            links: Vec::new(),
             pair: Pair::Unpaired,
             battery: None,
             signal: None,
@@ -111,11 +114,33 @@ impl DeviceState {
     }
 }
 
+impl DeviceState {
+    /// The link to use: Wi-Fi when we have it, Bluetooth otherwise.
+    fn link(&self) -> Option<&Link> {
+        self.links
+            .iter()
+            .find(|l| matches!(l.via, Via::Lan(_)))
+            .or_else(|| self.links.first())
+    }
+}
+
 #[derive(Clone)]
 struct Link {
     generation: u64,
-    peer: SocketAddr,
+    via: Via,
     tx: mpsc::UnboundedSender<Packet>,
+}
+
+#[derive(Clone)]
+enum Via {
+    Lan(SocketAddr),
+    Bluetooth { address: String, mux: Mux },
+}
+
+impl Via {
+    fn same_kind(&self, other: &Via) -> bool {
+        matches!((self, other), (Via::Lan(_), Via::Lan(_)) | (Via::Bluetooth { .. }, Via::Bluetooth { .. }))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +200,12 @@ impl Daemon {
         }
     }
 
+    #[cfg(test)]
+    fn with_downloads(mut self, dir: PathBuf) -> Self {
+        self.downloads = dir;
+        self
+    }
+
     pub fn set_lan(&self, lan: Lan) {
         let _ = self.lan.set(lan);
     }
@@ -202,7 +233,7 @@ impl Daemon {
         let mut out: Vec<api::Device> = st
             .devices
             .values()
-            .filter(|d| d.pair == Pair::Paired || d.link.is_some())
+            .filter(|d| d.pair == Pair::Paired || !d.links.is_empty())
             .map(|d| self.snapshot(d))
             .collect();
         out.sort_by(|a, b| {
@@ -225,15 +256,21 @@ impl Daemon {
             id: d.info.id.clone(),
             name: d.info.name.clone(),
             kind: api::DeviceKind::parse(&d.info.kind),
-            reachable: d.link.is_some(),
+            reachable: !d.links.is_empty(),
             pair: match d.pair {
                 Pair::Unpaired => api::PairState::Unpaired,
                 Pair::Requested(ts) => api::PairState::Requested { code: code(ts) },
                 Pair::RequestedByPeer(ts) => api::PairState::RequestedByPeer { code: code(ts) },
                 Pair::Paired => api::PairState::Paired,
             },
-            transport: d.link.as_ref().map(|_| api::Transport::Wifi),
-            address: d.link.as_ref().map(|l| l.peer.ip().to_canonical().to_string()),
+            transport: d.link().map(|l| match l.via {
+                Via::Lan(_) => api::Transport::Wifi,
+                Via::Bluetooth { .. } => api::Transport::Bluetooth,
+            }),
+            address: d.link().map(|l| match &l.via {
+                Via::Lan(peer) => peer.ip().to_canonical().to_string(),
+                Via::Bluetooth { address, .. } => address.clone(),
+            }),
             accepts: d.info.incoming.clone(),
             battery: d.battery,
             signal: d.signal.clone(),
@@ -251,13 +288,21 @@ impl Daemon {
 
     // ---- Links -------------------------------------------------------------
 
-    pub async fn run(self: Arc<Self>, mut connections: mpsc::Receiver<Connection>) {
-        while let Some(conn) = connections.recv().await {
-            self.on_connection(conn);
+    pub async fn run(
+        self: Arc<Self>,
+        mut lan: mpsc::Receiver<Connection>,
+        mut bt: mpsc::Receiver<(BtConnection, String)>,
+    ) {
+        loop {
+            tokio::select! {
+                Some(conn) = lan.recv() => self.on_lan(conn),
+                Some((conn, address)) = bt.recv() => self.on_bluetooth(conn, address),
+                else => break,
+            }
         }
     }
 
-    fn on_connection(self: &Arc<Self>, conn: Connection) {
+    fn on_lan(self: &Arc<Self>, conn: Connection) {
         let Connection {
             info,
             cert,
@@ -266,42 +311,93 @@ impl Daemon {
             writer,
         } = conn;
         let id = info.id.clone();
+        let Some((generation, rx)) = self.attach(&info, cert, Via::Lan(peer)) else {
+            return;
+        };
+        tokio::spawn(write_loop(writer, rx));
+        tokio::spawn(self.clone().read_loop(id, generation, reader));
+    }
+
+    fn on_bluetooth(self: &Arc<Self>, conn: BtConnection, address: String) {
+        let BtConnection {
+            info,
+            cert,
+            mux,
+            reader,
+            writer,
+        } = conn;
+        let id = info.id.clone();
+        let via = Via::Bluetooth {
+            address,
+            mux: mux.clone(),
+        };
+        let Some((generation, mut rx)) = self.attach(&info, cert, via) else {
+            mux.shutdown();
+            return;
+        };
+        tokio::spawn(async move {
+            while let Some(packet) = rx.recv().await {
+                if writer.write_all(&packet.to_line()).await.is_err() {
+                    break;
+                }
+            }
+            mux.shutdown();
+        });
+        tokio::spawn(self.clone().read_loop_bt(id, generation, reader));
+    }
+
+    /// Add a link to a device. Returns its generation and the queue for outgoing packets.
+    fn attach(
+        self: &Arc<Self>,
+        info: &DeviceInfo,
+        cert: CertificateDer<'static>,
+        via: Via,
+    ) -> Option<(u64, mpsc::UnboundedReceiver<Packet>)> {
+        let id = info.id.clone();
         let generation = self.next();
         let (tx, rx) = mpsc::unbounded_channel();
+        let transport = match &via {
+            Via::Lan(peer) => format!("Wi-Fi {peer}"),
+            Via::Bluetooth { address, .. } => format!("Bluetooth {address}"),
+        };
 
-        let paired = {
+        let (paired, first_link) = {
             let mut st = self.lock();
             if let Some(trusted) = st.trusted.get(&id)
-                && trusted.cert().as_ref() != Some(&cert) {
-                    tracing::warn!(%id, name = %info.name, "certificate changed since pairing; refusing");
-                    return;
-                }
+                && trusted.cert().as_ref() != Some(&cert)
+            {
+                tracing::warn!(%id, name = %info.name, "certificate changed since pairing; refusing");
+                return None;
+            }
             let device = st
                 .devices
                 .entry(id.clone())
                 .or_insert_with(|| DeviceState::new(info.clone()));
-            device.info = info.clone();
+            // Bluetooth identities are shorter on capabilities; don't lose what Wi-Fi told us.
+            if matches!(via, Via::Lan(_)) || device.links.is_empty() {
+                device.info = info.clone();
+            }
             device.cert = Some(cert);
-            device.link = Some(Link {
-                generation,
-                peer,
-                tx,
-            });
+            let first_link = device.links.is_empty();
+            if let Some(old) = device.links.iter().position(|l| l.via.same_kind(&via))
+                && let Via::Bluetooth { mux, .. } = &device.links.remove(old).via {
+                    mux.shutdown();
+                }
+            device.links.push(Link { generation, via, tx });
             let paired = device.pair == Pair::Paired;
             if let Some(t) = st.trusted.get_mut(&id).filter(|t| t.name != info.name) {
                 t.name = info.name.clone();
                 self.store.save_trusted(&st.trusted);
             }
-            paired
+            (paired, first_link)
         };
 
-        tokio::spawn(write_loop(writer, rx));
-        tokio::spawn(self.clone().read_loop(id.clone(), generation, reader));
-        tracing::info!(%id, name = %info.name, %peer, paired, "device connected");
-        if paired {
+        tracing::info!(%id, name = %info.name, via = %transport, paired, "device connected");
+        if paired && first_link {
             self.on_ready(&id);
         }
         self.emit(Signal::Changed);
+        Some((generation, rx))
     }
 
     async fn read_loop(self: Arc<Self>, id: String, generation: u64, mut reader: BufReader<ReadHalf<lan::Stream>>) {
@@ -318,24 +414,54 @@ impl Daemon {
         self.on_disconnect(&id, generation).await;
     }
 
+    async fn read_loop_bt(self: Arc<Self>, id: String, generation: u64, mut reader: LineReader) {
+        loop {
+            match reader.read_line(32 * 1024 * 1024).await {
+                Ok(Some(line)) => {
+                    if let Some(packet) = Packet::from_line(&line) {
+                        self.on_packet(&id, generation, packet).await;
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::debug!(%id, %err, "bluetooth read failed");
+                    break;
+                }
+            }
+        }
+        self.on_disconnect(&id, generation).await;
+    }
+
     async fn on_disconnect(&self, id: &str, generation: u64) {
-        let (popup, mount) = {
+        let (popup, mount, remaining) = {
             let mut st = self.lock();
             let Some(device) = st.devices.get_mut(id) else { return };
-            if device.link.as_ref().map(|l| l.generation) != Some(generation) {
+            let Some(index) = device.links.iter().position(|l| l.generation == generation) else {
                 return; // An older link; a newer one replaced it.
+            };
+            let lost = device.links.remove(index);
+            let remaining = device.links.len();
+            let mut popup = None;
+            if remaining == 0 {
+                if matches!(device.pair, Pair::Requested(_) | Pair::RequestedByPeer(_)) {
+                    device.pair = Pair::Unpaired;
+                }
+                popup = device.pair_popup.take();
+                if device.pair != Pair::Paired {
+                    st.devices.remove(id);
+                }
             }
-            device.link = None;
-            if matches!(device.pair, Pair::Requested(_) | Pair::RequestedByPeer(_)) {
-                device.pair = Pair::Unpaired;
-            }
-            let popup = device.pair_popup.take();
-            if device.pair != Pair::Paired {
-                st.devices.remove(id);
-            }
-            (popup, st.mounts.remove(id))
+            // Browsing goes over the network, so it ends with the Wi-Fi link.
+            let mount = matches!(lost.via, Via::Lan(_))
+                .then(|| st.mounts.remove(id))
+                .flatten();
+            (popup, mount, remaining)
         };
-        tracing::info!(%id, "device disconnected");
+        if remaining == 0 {
+            tracing::info!(%id, "device disconnected");
+        } else {
+            tracing::info!(%id, "one link dropped, still connected over another");
+        }
         if let Some(popup) = popup {
             self.close_popup(popup).await;
         }
@@ -345,10 +471,31 @@ impl Daemon {
         self.emit(Signal::Changed);
     }
 
+    /// Paired devices we can't currently reach: worth trying over Bluetooth.
+    pub fn wants_bluetooth(&self) -> bool {
+        self.lock()
+            .devices
+            .values()
+            .any(|d| d.pair == Pair::Paired && !d.links.iter().any(|l| matches!(l.via, Via::Bluetooth { .. })))
+    }
+
+    /// Bluetooth addresses we already have a link to.
+    pub fn bluetooth_addresses(&self) -> Vec<String> {
+        self.lock()
+            .devices
+            .values()
+            .flat_map(|d| d.links.iter())
+            .filter_map(|l| match &l.via {
+                Via::Bluetooth { address, .. } => Some(address.clone()),
+                Via::Lan(_) => None,
+            })
+            .collect()
+    }
+
     fn send(&self, id: &str, packet: Packet) -> Reply {
         let st = self.lock();
         let device = st.devices.get(id).ok_or("Unknown device")?;
-        let link = device.link.as_ref().ok_or_else(|| format!("{} is offline", device.info.name))?;
+        let link = device.link().ok_or_else(|| format!("{} is offline", device.info.name))?;
         link.tx
             .send(packet)
             .map_err(|_| format!("{} disconnected", device.info.name))
@@ -411,7 +558,7 @@ impl Daemon {
                 }
                 Pair::Unpaired => {}
             }
-            if device.link.is_none() {
+            if device.links.is_empty() {
                 return Err(format!("{} is offline", device.info.name));
             }
             device.pair = Pair::Requested(ts);
@@ -489,7 +636,7 @@ impl Daemon {
         if let Some(device) = st.devices.get_mut(id) {
             device.pair = Pair::Unpaired;
             device.notifications.clear();
-            if device.link.is_none() {
+            if device.links.is_empty() {
                 st.devices.remove(id);
             }
         }
@@ -499,7 +646,7 @@ impl Daemon {
         let link = st
             .devices
             .get(id)
-            .and_then(|d| d.link.as_ref())
+            .and_then(|d| d.link())
             .ok_or("The device is offline")?;
         link.tx.send(packet).map_err(|_| "The device disconnected".to_owned())
     }
@@ -623,13 +770,13 @@ impl Daemon {
     // ---- Packets -----------------------------------------------------------
 
     async fn on_packet(self: &Arc<Self>, id: &str, generation: u64, packet: Packet) {
-        let (paired, name) = {
+        let (paired, name, via) = {
             let st = self.lock();
             let Some(device) = st.devices.get(id) else { return };
-            if device.link.as_ref().map(|l| l.generation) != Some(generation) {
+            let Some(link) = device.links.iter().find(|l| l.generation == generation) else {
                 return;
-            }
-            (device.pair == Pair::Paired, device.info.name.clone())
+            };
+            (device.pair == Pair::Paired, device.info.name.clone(), link.via.clone())
         };
 
         if packet.is(packet::PAIR) {
@@ -647,7 +794,7 @@ impl Daemon {
             }
             "kdeconnect.battery" => self.on_battery(id, &name, &packet).await,
             "kdeconnect.connectivity_report" => self.on_connectivity(id, &packet),
-            "kdeconnect.share.request" => self.on_share(id, &name, packet).await,
+            "kdeconnect.share.request" => self.on_share(id, &name, &via, packet).await,
             "kdeconnect.share.request.update" => {}
             "kdeconnect.clipboard" | "kdeconnect.clipboard.connect" => {
                 if let Some(text) = packet.get_str("content").filter(|t| !t.is_empty()) {
@@ -812,6 +959,15 @@ impl Daemon {
     }
 
     pub async fn browse(&self, id: &str) -> Reply {
+        let over_bluetooth = self
+            .lock()
+            .devices
+            .get(id)
+            .and_then(|d| d.link())
+            .is_some_and(|l| matches!(l.via, Via::Bluetooth { .. }));
+        if over_bluetooth {
+            return Err("Browsing the phone's files needs Wi-Fi".into());
+        }
         let mounted = self.lock().mounts.get(id).cloned();
         if let Some(mount) = mounted {
             let _ = open::that_detached(&mount);
@@ -866,7 +1022,7 @@ impl Daemon {
 
     // ---- Sharing -----------------------------------------------------------
 
-    async fn on_share(self: &Arc<Self>, id: &str, name: &str, packet: Packet) {
+    async fn on_share(self: &Arc<Self>, id: &str, name: &str, via: &Via, packet: Packet) {
         if let Some(url) = packet.get_str("url") {
             if url.starts_with("http://") || url.starts_with("https://") {
                 let _ = open::that_detached(url);
@@ -878,20 +1034,31 @@ impl Daemon {
             });
             self.simple_popup(&format!("Text from {name}"), text).await;
         } else if packet.payload_size.is_some()
-            && let Err(err) = self.receive_file(id, packet) {
+            && let Err(err) = self.receive_file(id, via, packet) {
                 tracing::warn!(%id, %err, "couldn't receive file");
             }
     }
 
-    fn receive_file(self: &Arc<Self>, id: &str, packet: Packet) -> Reply {
-        let (peer, cert, device_name) = {
+    fn receive_file(self: &Arc<Self>, id: &str, via: &Via, packet: Packet) -> Reply {
+        let (cert, device_name) = {
             let st = self.lock();
             let device = st.devices.get(id).ok_or("Unknown device")?;
-            let link = device.link.as_ref().ok_or("Device went offline")?;
-            let cert = device.cert.clone().ok_or("No certificate")?;
-            (link.peer, cert, device.info.name.clone())
+            (device.cert.clone().ok_or("No certificate")?, device.info.name.clone())
         };
-        let port = packet.payload_port().ok_or("No payload port")?;
+        enum Source {
+            Lan(SocketAddr),
+            Bluetooth(pocketlink_proto::mux::Channel),
+        }
+        let source = match via {
+            Via::Lan(peer) => {
+                let port = packet.payload_port().ok_or("No payload port")?;
+                Source::Lan(SocketAddr::new(peer.ip(), port))
+            }
+            Via::Bluetooth { mux, .. } => {
+                let channel = bluetooth::payload_channel(&packet).ok_or("No payload channel")?;
+                Source::Bluetooth(mux.take_channel(channel).ok_or("Payload channel isn't open")?)
+            }
+        };
         let size = packet.payload_size.unwrap_or_default().max(0) as u64;
         let name = sanitize_file_name(packet.get_str("filename").unwrap_or("file"));
         std::fs::create_dir_all(&self.downloads).map_err(|e| e.to_string())?;
@@ -904,15 +1071,17 @@ impl Daemon {
             let result = async {
                 let file = tokio::fs::File::create(&part).await?;
                 let mut sink = BufWriter::new(file);
-                payload::receive(
-                    &daemon.tls,
-                    SocketAddr::new(peer.ip(), port),
-                    &cert,
-                    &mut sink,
-                    size,
-                    |n| daemon.progress(tid, n),
-                )
-                .await?;
+                match source {
+                    Source::Lan(addr) => {
+                        payload::receive(&daemon.tls, addr, &cert, &mut sink, size, |n| {
+                            daemon.progress(tid, n)
+                        })
+                        .await?
+                    }
+                    Source::Bluetooth(channel) => {
+                        bluetooth::receive(channel, &mut sink, size, |n| daemon.progress(tid, n)).await?
+                    }
+                }
                 sink.into_inner().sync_all().await?;
                 tokio::fs::rename(&part, &path).await?;
                 Ok::<_, pocketlink_proto::Error>(())
@@ -965,17 +1134,16 @@ impl Daemon {
             return Err("There are no files to send (folders aren't supported yet)".into());
         }
 
-        let (peer, cert, tx) = {
+        let (via, cert, tx) = {
             let st = self.lock();
             let device = st.devices.get(id).ok_or("Unknown device")?;
             if device.pair != Pair::Paired {
                 return Err(format!("{} isn't paired", device.info.name));
             }
             let link = device
-                .link
-                .as_ref()
+                .link()
                 .ok_or_else(|| format!("{} is offline", device.info.name))?;
-            (link.peer, device.cert.clone().ok_or("No certificate")?, link.tx.clone())
+            (link.via.clone(), device.cert.clone().ok_or("No certificate")?, link.tx.clone())
         };
 
         let total: u64 = files.iter().map(|(_, size, _)| size).sum();
@@ -1008,20 +1176,29 @@ impl Daemon {
                         continue;
                     }
 
-                    let server = PayloadServer::bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED)).await?;
                     packet.payload_size = Some(size as i64);
-                    let mut info = serde_json::Map::new();
-                    info.insert("port".into(), server.port().into());
-                    packet.payload_transfer_info = Some(info);
-                    tx.send(packet).map_err(|_| disconnected())?;
-
                     let file = tokio::fs::File::open(&path).await?;
                     let base = done;
-                    server
-                        .send(&daemon.tls, peer.ip(), &cert, file, size, |n| {
-                            daemon.progress(tid, base + n)
-                        })
-                        .await?;
+                    match &via {
+                        Via::Lan(peer) => {
+                            let server = PayloadServer::bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED)).await?;
+                            let mut info = serde_json::Map::new();
+                            info.insert("port".into(), server.port().into());
+                            packet.payload_transfer_info = Some(info);
+                            tx.send(packet).map_err(|_| disconnected())?;
+                            server
+                                .send(&daemon.tls, peer.ip(), &cert, file, size, |n| {
+                                    daemon.progress(tid, base + n)
+                                })
+                                .await?;
+                        }
+                        Via::Bluetooth { mux, .. } => {
+                            let channel = mux.open_channel();
+                            bluetooth::set_payload_channel(&mut packet, &channel);
+                            tx.send(packet).map_err(|_| disconnected())?;
+                            bluetooth::send(channel, file, size, |n| daemon.progress(tid, base + n)).await?;
+                        }
+                    }
                     done += size;
                 }
                 Ok::<_, pocketlink_proto::Error>(())
@@ -1298,5 +1475,124 @@ mod tests {
         assert!(looks_like_url(" https://example.com/x "));
         assert!(!looks_like_url("see https://example.com"));
         assert!(!looks_like_url("file:///etc/passwd"));
+    }
+
+    mod bluetooth_link {
+        use super::super::*;
+        use pocketlink_proto::PROTOCOL_VERSION;
+        use pocketlink_proto::bluetooth::Role;
+
+        const PHONE: &str = "b100700phone00000000000000000000";
+
+        fn info(id: &str, name: &str, kind: &str) -> DeviceInfo {
+            DeviceInfo {
+                id: id.into(),
+                name: name.into(),
+                kind: kind.into(),
+                protocol_version: PROTOCOL_VERSION,
+                incoming: INCOMING.iter().map(|s| (*s).to_owned()).collect(),
+                outgoing: OUTGOING.iter().map(|s| (*s).to_owned()).collect(),
+            }
+        }
+
+        async fn next_packet(reader: &mut LineReader) -> Packet {
+            let line = tokio::time::timeout(Duration::from_secs(5), reader.read_line(1 << 20))
+                .await
+                .expect("a packet in time")
+                .unwrap()
+                .expect("link open");
+            Packet::from_line(&line).unwrap()
+        }
+
+        async fn wait_until(daemon: &Daemon, what: &str, check: impl Fn(&api::Device) -> bool) {
+            for _ in 0..100 {
+                if daemon.devices().iter().any(|d| d.id == PHONE && check(d)) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("timed out waiting for {what}");
+        }
+
+        #[tokio::test]
+        async fn pairs_and_moves_files_over_bluetooth() {
+            let dir = std::env::temp_dir().join(format!("pocketlink-bt-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let store = Store::at(dir.join("config")).unwrap();
+            let identity = Identity::generate("b1007000pc000000000000000000000a").unwrap();
+            let tls = TlsConfigs::new(&identity).unwrap();
+            let me = info(&identity.device_id, "PC", "desktop");
+            let (me_tx, _) = watch::channel(me.clone());
+            let (signals, _signals_rx) = mpsc::unbounded_channel();
+            let daemon = Arc::new(
+                Daemon::new(store, identity.clone(), tls, me_tx, signals).with_downloads(dir.join("downloads")),
+            );
+
+            let phone_identity = Identity::generate(PHONE).unwrap();
+            let phone_info = info(PHONE, "BT Phone", "phone");
+            let (pc_end, phone_end) = tokio::io::duplex(1 << 16);
+            let (pc, phone) = tokio::join!(
+                bluetooth::handshake(pc_end, Role::Accepted, &me, &identity),
+                bluetooth::handshake(phone_end, Role::Connected, &phone_info, &phone_identity),
+            );
+            daemon.on_bluetooth(pc.unwrap(), "AA:BB:CC:DD:EE:FF".into());
+            let mut phone = phone.unwrap();
+
+            let snapshot = daemon.devices();
+            assert_eq!(snapshot[0].transport, Some(api::Transport::Bluetooth));
+            assert_eq!(snapshot[0].address.as_deref(), Some("AA:BB:CC:DD:EE:FF"));
+
+            // Pairing.
+            let ts = now_secs();
+            phone
+                .writer
+                .write_all(&Packet::new(packet::PAIR, json!({ "pair": true, "timestamp": ts })).to_line())
+                .await
+                .unwrap();
+            wait_until(&daemon, "the pair request", |d| {
+                matches!(d.pair, api::PairState::RequestedByPeer { .. })
+            })
+            .await;
+            daemon.accept_pair(PHONE).unwrap();
+            assert_eq!(next_packet(&mut phone.reader).await.get_bool("pair"), Some(true));
+            assert!(next_packet(&mut phone.reader).await.is("kdeconnect.notification.request"));
+
+            // PC → phone.
+            let outgoing = dir.join("song.mp3");
+            let data: Vec<u8> = (0..30_000u32).map(|i| (i % 211) as u8).collect();
+            std::fs::write(&outgoing, &data).unwrap();
+            daemon.send_files(PHONE, vec![outgoing]).unwrap();
+            let offer = next_packet(&mut phone.reader).await;
+            assert_eq!(offer.get_str("filename"), Some("song.mp3"));
+            let channel = phone
+                .mux
+                .take_channel(bluetooth::payload_channel(&offer).unwrap())
+                .unwrap();
+            let mut got = Vec::new();
+            bluetooth::receive(channel, &mut got, data.len() as u64, |_| {}).await.unwrap();
+            assert_eq!(got, data);
+
+            // Phone → PC.
+            let channel = phone.mux.open_channel();
+            let mut share = Packet::new("kdeconnect.share.request", json!({ "filename": "photo.jpg" }));
+            share.payload_size = Some(data.len() as i64);
+            bluetooth::set_payload_channel(&mut share, &channel);
+            phone.writer.write_all(&share.to_line()).await.unwrap();
+            bluetooth::send(channel, &data[..], data.len() as u64, |_| {}).await.unwrap();
+            let saved = dir.join("downloads").join("photo.jpg");
+            for _ in 0..100 {
+                if std::fs::read(&saved).ok().as_deref() == Some(&data[..]) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(std::fs::read(&saved).unwrap(), data);
+
+            // Losing the link keeps the pairing.
+            phone.mux.shutdown();
+            wait_until(&daemon, "the phone to go offline", |d| !d.reachable && d.paired()).await;
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

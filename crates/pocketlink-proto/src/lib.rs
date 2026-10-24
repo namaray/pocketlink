@@ -5,8 +5,10 @@
 //! Pocketlink speaks the same protocol as KDE Connect so it works with the
 //! existing phone apps, but shares no code with it.
 
+pub mod bluetooth;
 pub mod identity;
 pub mod lan;
+pub mod mux;
 pub mod packet;
 pub mod payload;
 pub mod tls;

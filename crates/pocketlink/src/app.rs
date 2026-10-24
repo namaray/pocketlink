@@ -13,12 +13,15 @@ use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, icon, nav_bar, settings, toaster};
 use pocketlink_core::{
     Client, Device, DeviceKind, Direction, Event, Notification, PairState, Transfer, TransferState,
-    caps,
+    Transport, caps,
 };
 
 use crate::drop::{self, Payload};
 
 const APP_ICON: &[u8] = include_bytes!("../resources/icon.svg");
+
+/// Above this, warn that Bluetooth (roughly 100–200 KB/s) will take a while.
+const BLUETOOTH_SLOW_BYTES: u64 = 10_000_000;
 
 pub struct App {
     core: cosmic::Core,
@@ -505,10 +508,22 @@ impl App {
 
         match payload {
             Payload::Files(paths) => {
+                let over_bluetooth = device.transport == Some(Transport::Bluetooth);
                 let (files, folders): (Vec<_>, Vec<_>) = paths.into_iter().partition(|p| !p.is_dir());
                 let mut tasks = Vec::new();
                 if !folders.is_empty() {
                     tasks.push(self.toast("Folders can't be sent yet, so they were skipped"));
+                }
+                let total: u64 = files
+                    .iter()
+                    .filter_map(|f| std::fs::metadata(f).ok())
+                    .map(|m| m.len())
+                    .sum();
+                if over_bluetooth && total > BLUETOOTH_SLOW_BYTES {
+                    tasks.push(self.toast(format!(
+                        "Sending {} over Bluetooth will be slow. Wi-Fi is much faster.",
+                        bytes(total)
+                    )));
                 }
                 if !files.is_empty() {
                     tasks.push(self.call(move |client, id| async move {
@@ -881,9 +896,12 @@ fn hero(device: &Device) -> Element<'_, Message> {
         }),
     );
 
-    let status_text = match (online, &device.address) {
-        (true, Some(address)) => format!("Connected over Wi-Fi · {address}"),
-        (true, None) => "Connected".to_owned(),
+    let status_text = match (online, device.transport) {
+        (true, Some(Transport::Bluetooth)) => "Connected over Bluetooth".to_owned(),
+        (true, _) => match &device.address {
+            Some(address) => format!("Connected over Wi-Fi · {address}"),
+            None => "Connected".to_owned(),
+        },
         (false, _) => "Offline".to_owned(),
     };
 

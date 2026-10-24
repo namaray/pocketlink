@@ -99,6 +99,7 @@ async fn fake_phone_pairs_and_shares() {
             .env("POCKETLINK_UDP_PORT", UDP_PORT.to_string())
             .env("POCKETLINK_NO_NOTIFY", "1")
             .env("POCKETLINK_NO_BROADCAST", "1")
+            .env("POCKETLINK_NO_BLUETOOTH", "1")
             .env("RUST_LOG", "info,pocketlink_proto=debug")
             .spawn()
             .expect("daemon starts"),
