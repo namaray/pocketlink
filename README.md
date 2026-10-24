@@ -45,9 +45,24 @@ Android app once that exists.
 | `pocketlink-core` | The D-Bus client and the shared types apps use |
 | `pocketlink` | The COSMIC app |
 
+## Security
+
 Security works like KDE Connect: every device has a self-signed certificate, and pairing pins
 it. After pairing, a device claiming the same id with a different certificate is refused, and
 file transfers check the certificate on both ends.
+
+- Unpaired devices can only ask to pair; everything else they send is ignored. At most 42
+  unpaired devices can be connected at once.
+- A paired device is trusted: it can send files (saved to Downloads under a cleaned-up name),
+  put text on your clipboard, and open http(s) links in your browser.
+- *Browse files* only reacts to the phone's answer to your own request, and the SFTP details in
+  it are validated before `sshfs` sees them.
+- Text from the phone is escaped before it's shown in desktop notifications.
+- Any program running as you can use the D-Bus API, the same as with KDE Connect.
+- Over Bluetooth there is no TLS: the link relies on Bluetooth pairing, and the certificate in
+  the identity packet is compared with the pinned one but not proven.
+- `sshfs` is run with `StrictHostKeyChecking=no`, like KDE Connect, so the phone's SFTP host key
+  isn't verified.
 
 ## Wi-Fi and Bluetooth
 

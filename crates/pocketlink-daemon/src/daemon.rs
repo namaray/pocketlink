@@ -51,6 +51,9 @@ pub const OUTGOING: &[&str] = &[
 const PAIR_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CLOCK_SKEW_SECS: i64 = 30 * 60;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+const BROWSE_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Same limit as KDE Connect: strangers on the network can't pile up connections.
+const MAX_UNPAIRED: usize = 42;
 
 /// Something apps should hear about. Sent as D-Bus signals.
 #[derive(Debug, Clone)]
@@ -96,6 +99,8 @@ struct DeviceState {
     /// Phone notification id → desktop notification id.
     popups: HashMap<String, u32>,
     pair_popup: Option<u32>,
+    /// When we last asked the phone to start its SFTP server.
+    browse_requested: Option<Instant>,
 }
 
 impl DeviceState {
@@ -110,6 +115,7 @@ impl DeviceState {
             notifications: BTreeMap::new(),
             popups: HashMap::new(),
             pair_popup: None,
+            browse_requested: None,
         }
     }
 }
@@ -367,6 +373,11 @@ impl Daemon {
                 && trusted.cert().as_ref() != Some(&cert)
             {
                 tracing::warn!(%id, name = %info.name, "certificate changed since pairing; refusing");
+                return None;
+            }
+            let unpaired = st.devices.values().filter(|d| d.pair != Pair::Paired).count();
+            if !st.devices.contains_key(&id) && !st.trusted.contains_key(&id) && unpaired >= MAX_UNPAIRED {
+                tracing::warn!(%id, "too many unpaired devices connected; ignoring this one");
                 return None;
             }
             let device = st
@@ -973,10 +984,25 @@ impl Daemon {
             let _ = open::that_detached(&mount);
             return Ok(());
         }
-        self.send_paired(id, Packet::new("kdeconnect.sftp.request", json!({ "startBrowsing": true })))
+        self.send_paired(id, Packet::new("kdeconnect.sftp.request", json!({ "startBrowsing": true })))?;
+        if let Some(device) = self.lock().devices.get_mut(id) {
+            device.browse_requested = Some(Instant::now());
+        }
+        Ok(())
     }
 
     async fn on_sftp(&self, id: &str, packet: &Packet) {
+        // Only act on an answer to our own request: the reply makes us run sshfs.
+        let requested = self
+            .lock()
+            .devices
+            .get_mut(id)
+            .and_then(|d| d.browse_requested.take())
+            .is_some_and(|at| at.elapsed() < BROWSE_REPLY_TIMEOUT);
+        if !requested {
+            tracing::warn!(%id, "ignoring an SFTP offer we didn't ask for");
+            return;
+        }
         if let Some(err) = packet.get_str("errorMessage") {
             self.simple_popup("Can't browse the phone", err).await;
             return;
@@ -990,6 +1016,10 @@ impl Daemon {
             return;
         };
         let path = packet.get_str("path").unwrap_or("/");
+        let Some(target) = SftpTarget::parse(user, ip, port, path) else {
+            tracing::warn!(%id, "ignoring an SFTP offer with unsafe details");
+            return;
+        };
         let name = self
             .lock()
             .devices
@@ -1001,7 +1031,7 @@ impl Daemon {
             .join("pocketlink")
             .join(sanitize_file_name(&name));
 
-        match mount_sshfs(&mount, user, ip, port, path, password).await {
+        match mount_sshfs(&mount, &target, password).await {
             Ok(()) => {
                 self.lock().mounts.insert(id.to_owned(), mount.clone());
                 let _ = open::that_detached(&mount);
@@ -1356,14 +1386,50 @@ async fn write_loop(mut writer: WriteHalf<lan::Stream>, mut rx: mpsc::UnboundedR
     let _ = writer.shutdown().await;
 }
 
-async fn mount_sshfs(mount: &Path, user: &str, ip: &str, port: i64, path: &str, password: &str) -> Result<(), String> {
+/// Where the phone's SFTP server is, checked so none of it can be read as an sshfs option.
+#[derive(Debug, PartialEq)]
+struct SftpTarget {
+    user: String,
+    ip: IpAddr,
+    port: u16,
+    path: String,
+}
+
+impl SftpTarget {
+    fn parse(user: &str, ip: &str, port: i64, path: &str) -> Option<Self> {
+        let user_ok = !user.is_empty()
+            && user.len() <= 64
+            && !user.starts_with('-')
+            && user.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+        let path_ok = path.starts_with('/') && !path.chars().any(char::is_control);
+        if !user_ok || !path_ok {
+            return None;
+        }
+        Some(Self {
+            user: user.to_owned(),
+            ip: ip.parse().ok()?,
+            port: u16::try_from(port).ok().filter(|p| *p != 0)?,
+            path: path.to_owned(),
+        })
+    }
+
+    /// `user@host:path`, with IPv6 hosts in brackets.
+    fn remote(&self) -> String {
+        match self.ip {
+            IpAddr::V4(ip) => format!("{}@{ip}:{}", self.user, self.path),
+            IpAddr::V6(ip) => format!("{}@[{ip}]:{}", self.user, self.path),
+        }
+    }
+}
+
+async fn mount_sshfs(mount: &Path, target: &SftpTarget, password: &str) -> Result<(), String> {
     use tokio::process::Command;
 
     tokio::fs::create_dir_all(mount).await.map_err(|e| e.to_string())?;
     let mut child = Command::new("sshfs")
-        .arg(format!("{user}@{ip}:{path}"))
+        .arg(target.remote())
         .arg(mount)
-        .args(["-p", &port.to_string()])
+        .args(["-p", &target.port.to_string()])
         .args(["-o", "password_stdin"])
         .args(["-o", "StrictHostKeyChecking=no"])
         .args(["-o", "UserKnownHostsFile=/dev/null"])
@@ -1468,6 +1534,23 @@ mod tests {
         assert_eq!(unique_path(&dir, "a.txt"), dir.join("a (2).txt"));
         assert_eq!(unique_path(&dir, "b"), dir.join("b"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sftp_targets_cannot_smuggle_options() {
+        let ok = SftpTarget::parse("kdeconnect", "192.168.0.183", 1739, "/storage/emulated/0").unwrap();
+        assert_eq!(ok.remote(), "kdeconnect@192.168.0.183:/storage/emulated/0");
+        let v6 = SftpTarget::parse("u", "fe80::1", 22, "/").unwrap();
+        assert_eq!(v6.remote(), "u@[fe80::1]:/");
+
+        assert!(SftpTarget::parse("-oProxyCommand=sh -c evil", "192.168.0.2", 22, "/").is_none());
+        assert!(SftpTarget::parse("me", "-oProxyCommand=evil", 22, "/").is_none());
+        assert!(SftpTarget::parse("me", "host.example", 22, "/").is_none());
+        assert!(SftpTarget::parse("me", "10.0.0.1", 22, "relative").is_none());
+        assert!(SftpTarget::parse("me", "10.0.0.1", 22, "/DCIM/My Photos").is_some());
+        assert!(SftpTarget::parse("me", "10.0.0.1", 22, "/a\nb").is_none());
+        assert!(SftpTarget::parse("me", "10.0.0.1", 70000, "/").is_none());
+        assert!(SftpTarget::parse("me", "10.0.0.1", 0, "/").is_none());
     }
 
     #[test]

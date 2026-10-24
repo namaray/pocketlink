@@ -139,7 +139,7 @@ impl Notifier {
         }
 
         let id = proxy
-            .notify(note.app, replaces, note.icon, note.summary, note.body, &flat, hints, -1)
+            .notify(note.app, replaces, note.icon, note.summary, &escape_markup(note.body), &flat, hints, -1)
             .await
             .inspect_err(|err| tracing::debug!(%err, "notify failed"))
             .ok()?;
@@ -154,5 +154,21 @@ impl Notifier {
             let _ = proxy.close_notification(id).await;
         }
         self.pending.lock().expect("not poisoned").remove(&id);
+    }
+}
+
+/// Notification bodies may be read as markup; text from the phone must stay plain text.
+fn escape_markup(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn escapes_markup() {
+        assert_eq!(
+            super::escape_markup("<a href=\"x\">hi</a> & bye"),
+            "&lt;a href=\"x\"&gt;hi&lt;/a&gt; &amp; bye"
+        );
     }
 }

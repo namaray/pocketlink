@@ -25,6 +25,8 @@ use uuid::Uuid;
 pub const DEFAULT_CHANNEL: Uuid = uuid::uuid!("a0d0aaf4-1072-4d81-aa35-902a954b1266");
 
 const BUFFER_SIZE: usize = 4096;
+/// One per file in flight; a peer opening more than this is misbehaving.
+const MAX_CHANNELS: usize = 256;
 const HEADER: usize = 19;
 
 const VERSION: u8 = 0;
@@ -214,7 +216,11 @@ impl Mux {
                     got_version = true;
                 }
                 OPEN => {
-                    self.channels().entry(id).or_insert_with(|| ChannelShared::new(id));
+                    let mut channels = self.channels();
+                    if channels.len() >= MAX_CHANNELS && !channels.contains_key(&id) {
+                        return Err(invalid("too many open channels"));
+                    }
+                    channels.entry(id).or_insert_with(|| ChannelShared::new(id));
                 }
                 CLOSE => {
                     let ch = self.channels().remove(&id);
